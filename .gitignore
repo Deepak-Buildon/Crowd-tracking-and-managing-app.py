@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv
+venv/
+ENV/
+
+# Databases
+*.db
+crowd.db
+
+# Large Models
+*.pt
+yolov8n.pt
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Video files (avoid large recordings)
+*.mp4
+*.avi
+*.mkv
