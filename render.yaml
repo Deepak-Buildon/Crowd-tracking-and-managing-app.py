@@ -2,10 +2,11 @@ services:
   - type: web
     name: crowd-monitor-system
     env: python
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app
     envVars:
       - key: PORT
-        value: 5000
+        value: 10000
       - key: PYTHON_VERSION
-        value: 3.10.5
+        value: 3.11.0
