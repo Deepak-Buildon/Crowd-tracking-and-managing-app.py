@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin Dashboard - Crowd Monitor</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
+    <style>
+        /* CSS stays the same as dashboard.html */
+        body { font-family: 'Segoe UI', sans-serif; margin: 0; display: flex; flex-direction: column; height: 100vh; }
+        header { background: #333; color: white; padding: 1rem; display: flex; justify-content: space-between; align-items: center; }
+        .stats { display: flex; gap: 20px; font-size: 0.9rem; }
+        .stat-box { background: #444; padding: 5px 10px; border-radius: 4px; }
+        .stat-value { font-weight: bold; color: #4caf50; }
+        .stat-value.danger { color: #f44336; }
+        .dashboard-container { display: flex; flex-grow: 1; overflow: hidden; }
+        .map-section { flex: 1; position: relative; border-right: 2px solid #333; }
+        .cctv-section { flex: 1; background: #000; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 10px; }
+        .video-container { width: 100%; position: relative; border: 2px solid #555; }
+        .video-container img { width: 100%; display: block; }
+        .cctv-overlay { position: absolute; top: 10px; left: 10px; color: #0f0; background: rgba(0,0,0,0.6); padding: 5px; font-family: monospace; }
+        .refresh-btn { background: #222; color: #0f0; border: 1px solid #0f0; padding: 5px 12px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Crowd Management Dashboard</h1>
+        <div class="stats">
+            <div class="stat-box">Active Users: <span id="total-users">0</span></div>
+            <div class="stat-box">Zones: <span id="crowd-zones">0</span></div>
+            <div class="stat-box">CCTV: <span id="camera-count">0</span></div>
+        </div>
+    </header>
+    <div class="dashboard-container">
+        <div class="map-section"><div id="map" style="height: 100%;"></div></div>
+        <div class="cctv-section">
+            <div style="display: flex; justify-content: space-between; width: 100%; margin-bottom: 10px;">
+                <h2 style="color: #fff; margin:0;">📹 LIVE CCTV</h2>
+                <button onclick="refreshCamera()" class="refresh-btn">🔄 Refresh</button>
+            </div>
+            <div class="video-container">
+                <img id="cctv-feed" src="https://placehold.co/640x480?text=CCTV+Connecting..." alt="CCTV Feed">
+                <div class="cctv-overlay">LIVE • REGION-01</div>
+            </div>
+        </div>
+    </div>
+    <audio id="alert-sound" src="https://assets.mixkit.co/sfx/preview/mixkit-alarm-digital-clock-beep-989.mp3"></audio>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/leaflet.heat/dist/leaflet-heat.js"></script>
+    <script>
+        // CONFIGURATION: Set your Render URL here
+        const BACKEND_URL = localStorage.getItem('backend_url') || "";
+        if (!BACKEND_URL) {
+            const url = prompt("Enter your Render Backend URL (e.g. https://my-app.onrender.com):");
+            if (url) localStorage.setItem('backend_url', url);
+        }
+
+        const map = L.map('map').setView([20, 0], 2);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+        let markers = {};
+        let zoneLayers = [];
+        let heatLayer = null;
+
+        document.getElementById('cctv-feed').src = BACKEND_URL + "/video_feed";
+
+        async function fetchLocations() {
+            try {
+                const response = await fetch(BACKEND_URL + '/current-locations');
+                const data = await response.json();
+                document.getElementById('total-users').innerText = data.total_active;
+                document.getElementById('crowd-zones').innerText = data.crowd_zones;
+                document.getElementById('camera-count').innerText = data.camera_count;
+
+                // Clear Red Zones
+                zoneLayers.forEach(l => map.removeLayer(l));
+                zoneLayers = [];
+
+                if (data.red_zones) {
+                    data.red_zones.forEach(z => {
+                        const circle = L.circle([z.lat, z.lon], {color:'red', radius:z.radius}).addTo(map);
+                        zoneLayers.push(circle);
+                    });
+                }
+
+                data.users.forEach(u => {
+                    const color = u.is_crowded ? 'red' : 'green';
+                    if (markers[u.id]) {
+                        markers[u.id].setLatLng([u.latitude, u.longitude]).setStyle({color:color});
+                    } else {
+                        markers[u.id] = L.circleMarker([u.latitude, u.longitude], {color:color, radius:5}).addTo(map);
+                    }
+                });
+            } catch (e) { console.error(e); }
+        }
+
+        function refreshCamera() {
+            document.getElementById('cctv-feed').src = BACKEND_URL + "/video_feed?t=" + Date.now();
+        }
+
+        setInterval(fetchLocations, 5000);
+        fetchLocations();
+    </script>
+</body>
+</html>
