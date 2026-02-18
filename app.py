@@ -1,6 +1,6 @@
 from flask import Flask, render_template, request, jsonify, Response
+from flask_cors import CORS
 import sqlite3
-
 import math
 from datetime import datetime
 import os
@@ -10,13 +10,15 @@ from twilio.rest import Client
 from alert import Alertmsg
 
 app = Flask(__name__)
+CORS(app) # Allow all origins for the Netlify frontend
+
 DB_NAME = "crowd.db"
 
 # Camera Configuration
 IP_CAMERA_IPV4 = "http://100.104.168.30:8080/video"
 IP_CAMERA_IPV6 = "http://[2401:4900:7b59:cb18:2d91:2461:fefe:1f45]:8080/video"
 
-# List of sources to try in order
+# List of sources to try. IPv4 is usually more stable.
 camera_sources = [IP_CAMERA_IPV4, IP_CAMERA_IPV6, 0] 
 
 
@@ -56,29 +58,42 @@ except ImportError:
 def generate_frames():
     global CAMERA_PERSON_COUNT, LAST_CAMERA_UPDATE
     
-    cap = None
-    # Try available sources
-    for src in camera_sources:
-        print(f"Attempting to connect to camera source: {src}")
-        cap = cv2.VideoCapture(src)
-        if cap.isOpened():
-            print(f"Successfully connected to {src}")
-            break
-        cap.release()
+    def get_working_cap():
+        for src in camera_sources:
+            print(f"DEBUG: Attempting camera source: {src}")
+            # Use CAP_FFMPEG to potentially speed up connection failures on Windows
+            temp_cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
+            if temp_cap.isOpened():
+                # Test a read to be 100% sure it's valid
+                ret, _ = temp_cap.read()
+                if ret:
+                    print(f"DEBUG: Successfully connected to {src}")
+                    return temp_cap
+            temp_cap.release()
+        return None
+
+    cap = get_working_cap()
     
-    if not cap or not cap.isOpened():
-        print("Error: Could not open any camera source.")
+    if not cap:
+        print("CRITICAL: No camera sources available. Please check your IP Camera app.")
         return
 
     while True:
         success, frame = cap.read()
         if not success:
-            # Re-try loop if stream breaks
+            print("WARNING: Camera stream lost. Reconnecting...")
             cap.release()
-            for src in camera_sources:
-                cap = cv2.VideoCapture(src)
-                if cap.isOpened(): break
+            import time
+            time.sleep(2) # Wait before retry
+            cap = get_working_cap()
+            if not cap:
+                # Total failure - stop generator or wait?
+                # We'll wait and try again
+                time.sleep(5)
+                cap = get_working_cap()
+                if not cap: continue
             continue
+
 
         count = 0
         if yolo_model:
@@ -447,4 +462,6 @@ def get_current_locations():
 
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    # Use the port assigned by Render, or default to 5000
+    port = int(os.environ.get("PORT", 5000))
+    app.run(debug=False, host='0.0.0.0', port=port)

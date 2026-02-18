@@ -133,7 +133,31 @@
         .red {
             background: red;
         }
+        .refresh-btn {
+            background: #222;
+            color: #0f0;
+            border: 1px solid #0f0;
+            padding: 5px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            transition: all 0.3s;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        .refresh-btn:hover {
+            background: #0f0;
+            color: #000;
+            box-shadow: 0 0 10px rgba(0, 255, 0, 0.4);
+        }
+
+        .refresh-btn:active {
+            transform: scale(0.95);
+        }
     </style>
+
 </head>
 
 <body>
@@ -161,8 +185,13 @@
             </div>
         </div>
         <div class="cctv-section">
-            <h2 style="color: #fff; margin-top: 0; font-size: 1rem; align-self: flex-start;">📹 LIVE CCTV FOOTAGE
-                (YOLOv8)</h2>
+            <div style="display: flex; justify-content: space-between; width: 100%; align-items: center; margin-bottom: 10px;">
+                <h2 style="color: #fff; margin: 0; font-size: 1rem;">📹 LIVE CCTV FOOTAGE (YOLOv8)</h2>
+                <button onclick="refreshCamera()" class="refresh-btn">
+                    <span>🔄</span> Refresh Camera
+                </button>
+            </div>
+
             <div class="video-container">
                 <img src="{{ url_for('video_feed') }}"
                     onerror="this.src='https://placehold.co/640x480?text=CCTV+Feed+Connecting...'" alt="CCTV Feed">
@@ -330,8 +359,19 @@
             }
         }
 
+        function refreshCamera() {
+            const img = document.querySelector('.video-container img');
+            const originalSrc = "{{ url_for('video_feed') }}";
+            img.src = ""; // Clear momentarily
+            setTimeout(() => {
+                img.src = originalSrc + "?t=" + new Date().getTime();
+            }, 100);
+            console.log("CCTV Stream Reconnecting...");
+        }
+
         // Poll every 5 seconds
         setInterval(fetchLocations, 5000);
+
         fetchLocations(); // Initial call
     </script>
 

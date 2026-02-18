@@ -1,6 +1,7 @@
 Flask==3.0.0
+flask-cors
 gunicorn==21.2.0
 twilio==9.0.0
 ultralytics==8.0.0
-opencv-python
+opencv-python-headless
 requests
