@@ -1,0 +1,9 @@
+[build]
+  publish = "public"
+  command = ""
+
+# Redirects to handle single page app feel for the dashboard
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

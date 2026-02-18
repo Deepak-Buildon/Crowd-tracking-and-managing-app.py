@@ -1,47 +1,54 @@
-# Crowd Management & Event Monitoring System
+# 🚀 Crowd Management & Monitor System
 
-A real-time crowd tracking and event monitoring system built with Python Flask and SQLite.
+A professional, real-time crowd tracking and management application using **Python Flask**, **YOLOv8 AI**, and **Google Maps**.
 
-## Features
-- **User Registration**: Simple web interface for attendees to check-in.
-- **Live Tracking**: Monitors user locations via GPS.
-- **Crowd Detection**: Automatically detects high-density areas (more than 5 people within 100m).
-- **Safety Alerts**: Sends instant warnings to users in crowded zones with an exit route link.
-- **Admin Dashboard**: Live map visualization of all attendees and crowd status.
+## 📁 Project Structure
 
-## Prerequisites
-- Python 3.x
-- Modern web browser with Geolocation support
+- 🧠 **Backend (`app.py`)**: Handles AI processing, database management, and SMS alerts.
+- 🎨 **Dashboard (`templates/`)**: Flask-based admin interface.
+- 🌐 **Static Frontend (`public/`)**: Optimized version for Netlify hosting.
+- 📱 **Mobile Support (`android_client/`)**: Source code for the Android tracking app.
 
-## Installation
+---
 
-1. Create a virtual environment (optional but recommended):
-   ```bash
-   python -m venv venv
-   # Windows
-   venv\Scripts\activate
-   # Mac/Linux
-   source venv/bin/activate
-   ```
+## 🚀 How to Launch (The "Automatic" Way)
 
-2. Install dependencies:
+I have configured the project for **Zero-Config Deployment**.
+
+### 1. The Backend (CCTV & AI) - Host on Render
+1. Go to [Render Blueprints](https://dashboard.render.com/blueprints).
+2. Connect this GitHub repository.
+3. Render will use the `render.yaml` file to **automatically** set up the Free Tier server.
+4. Copy the URL Render gives you (e.g., `https://crowd-monitor.onrender.com`).
+
+### 2. The Frontend (Dashboard) - Host on Netlify
+1. Go to [Netlify](https://app.netlify.com/).
+2. Drag and drop the `public` folder OR connect your GitHub.
+3. Netlify will use the `netlify.toml` file to **automatically** configure the site.
+4. Open your new `.netlify.app` link.
+5. **Final Step**: Enter your Render URL when prompted to sync the systems.
+
+---
+
+## 🛠 Local Setup (For Development)
+
+1. **Install Dependencies**:
    ```bash
    pip install -r requirements.txt
    ```
-
-3. Run the application:
+2. **Run the App**:
    ```bash
    python app.py
    ```
+3. **Access Internal Dashboard**: `http://localhost:5000/dashboard`
 
-4. Access the application:
-   - **Registration Page**: http://localhost:5000/
-   - **Admin Dashboard**: http://localhost:5000/dashboard
+---
 
-## Testing Locally
-To simulate a crowd, open the registration page in multiple browser tabs (Incognito mode helps simulate different users) or use multiple devices on the same network (you'll need to use your local IP address instead of localhost, e.g., `http://192.168.1.5:5000`).
+## 🔥 Key Features
+- **YOLOv8 CCTV**: Real-time person counting from IP Cameras or Webcams.
+- **GPS Zoning**: Automatic detection of heavy crowd clusters on a live map.
+- **Smart SMS**: Directly alerts users in danger zones via Twilio.
+- **Reboot Button**: Instant CCTV stream recovery button on the dashboard.
 
-## Notes
-- Browser Geolocation requires HTTPS or `localhost`. If checking via local IP from mobile, some browsers might block geolocation unless you set up SSL or use a tunneling service like ngrok.
-- `crowd.db` is automatically created on first run.
-
+---
+*Created with ❤️ for Crowd Safety.*
