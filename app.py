@@ -2,466 +2,463 @@ from flask import Flask, render_template, request, jsonify, Response
 from flask_cors import CORS
 import sqlite3
 import math
-from datetime import datetime
 import os
 import cv2
-
-from twilio.rest import Client
+import threading
+import time
+import requests as http_requests
+from datetime import datetime, timedelta
 from alert import Alertmsg
 
 app = Flask(__name__)
-CORS(app) # Allow all origins for the Netlify frontend
+CORS(app)
 
 DB_NAME = "crowd.db"
+yolo_model = None
 
-# Camera Configuration
-IP_CAMERA_IPV4 = "http://100.104.168.30:8080/video"
-IP_CAMERA_IPV6 = "http://[2401:4900:7b59:cb18:2d91:2461:fefe:1f45]:8080/video"
+# Thresholds
+GPS_THRESHOLD = 5
+CCTV_THRESHOLD = 3
+RADIUS_METERS = 50
+CHECK_INTERVAL = 5 # seconds
 
-# List of sources to try. IPv4 is usually more stable.
-camera_sources = [IP_CAMERA_IPV4, IP_CAMERA_IPV6, 0] 
-
-
-# Initialize Alert System with specific credentials
+# Multi-Channel Alert System (n8n, Telegram, etc)
 alert_system = Alertmsg()
-# Override with user provided creds to be sure
-alert_system.account_sid = "ACb34032adfa3fba953d8e5cd926cfa986"
-alert_system.auth_token = "62fb90d39fd1ecc22a627790f5367c56"
-alert_system.from_number = '+17752528920'
 
-# Target for alerts
-ADMIN_PHONE_NUMBER = os.environ.get('ADMIN_PHONE_NUMBER', '+0987654321')
+# --- CONFIGURE YOUR ALERT CHANNELS HERE ---
+# n8n Webhook (enabled)
+alert_system.use_webhook = True
+alert_system.webhook_url = "https://achu1211.app.n8n.cloud/webhook/crowd-alert"
 
-# Threholds
-CROWD_THRESHOLD_LOC = 5 
-CROWD_THRESHOLD_CAM = 3
-ALERT_COOLDOWN_SECONDS = 600 # 10 minutes to avoid spam
+# Telegram (enabled) - Bot: @CrowdAlert_YourName_bot
+alert_system.use_telegram = True
+alert_system.telegram_bot_token = "8542498176:AAGk5Z-_5GYIn6RGkCP73aZ8K3gywYn0vaQ"
+alert_system.telegram_chat_id = "7244447138"  # Dammy
 
-ALERT_MESSAGE = 'u are in heavy crowd so move away from it "your life is important to us "'
+# WhatsApp via CallMeBot (disabled - no key yet)
+alert_system.use_whatsapp = False
+alert_system.whatsapp_apikey = ""
+# ------------------------------------------
 
-
-# Crowd Detection Settings
-CROWD_RADIUS_KM = 0.02  # 20 meters for tight clustering, active users are close
-# Using thresholds defined above (CROWD_THRESHOLD_LOC and CROWD_THRESHOLD_CAM)
-
-# Global State
+# Global states
 CAMERA_PERSON_COUNT = 0
 LAST_CAMERA_UPDATE = None
+GLOBAL_CROWDED_USERS = set()
+GLOBAL_RED_ZONES = []
 
-# Initialize YOLO (Global to avoid reloading)
-try:
-    from ultralytics import YOLO
-    yolo_model = YOLO("yolov8n.pt")
-except ImportError:
-    yolo_model = None
+# Camera Sources (Add your IP Camera URL here)
+camera_sources = [0, "http://100.104.168.30:8080/video"]
 
 def generate_frames():
     global CAMERA_PERSON_COUNT, LAST_CAMERA_UPDATE
     
-    def get_working_cap():
-        for src in camera_sources:
-            print(f"DEBUG: Attempting camera source: {src}")
-            # Use CAP_FFMPEG to potentially speed up connection failures on Windows
-            temp_cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
-            if temp_cap.isOpened():
-                # Test a read to be 100% sure it's valid
-                ret, _ = temp_cap.read()
-                if ret:
-                    print(f"DEBUG: Successfully connected to {src}")
-                    return temp_cap
-            temp_cap.release()
-        return None
-
-    cap = get_working_cap()
-    
+    cap = None
+    for src in camera_sources:
+        temp_cap = cv2.VideoCapture(src)
+        if temp_cap.isOpened():
+            cap = temp_cap
+            break
+            
     if not cap:
-        print("CRITICAL: No camera sources available. Please check your IP Camera app.")
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + b'' + b'\r\n')
         return
 
     while True:
+        if cap is None:
+            break
         success, frame = cap.read()
         if not success:
-            print("WARNING: Camera stream lost. Reconnecting...")
-            cap.release()
-            import time
-            time.sleep(2) # Wait before retry
-            cap = get_working_cap()
-            if not cap:
-                # Total failure - stop generator or wait?
-                # We'll wait and try again
-                time.sleep(5)
-                cap = get_working_cap()
-                if not cap: continue
-            continue
-
-
+            break
+        
+        # YOLO detection
         count = 0
         if yolo_model:
             results = yolo_model(frame, conf=0.4, verbose=False)
             for r in results:
-                for box in r.boxes:
-                    cls = int(box.cls[0])
-                    # YOLO counts both 'person' and 'face' if using a specific model, 
-                    # but with yolov8n, we mainly look for 'person'.
-                    if yolo_model.names[cls] == "person":
-                        count += 1
-                        x1, y1, x2, y2 = map(int, box.xyxy[0])
-                        # High visibility boxes
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                        cv2.putText(frame, f"Person", (x1, y1 - 10), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-            
+                if hasattr(r, 'boxes') and r.boxes is not None:
+                    for box in r.boxes:
+                        cls = int(box.cls[0])
+                        if yolo_model.names[cls] == "person":
+                            count = count + 1
             CAMERA_PERSON_COUNT = count
             LAST_CAMERA_UPDATE = datetime.now().strftime('%H:%M:%S')
 
-            # Alert if CCTV shows >= 3 persons
-            if CAMERA_PERSON_COUNT >= CROWD_THRESHOLD_CAM:
-                # Trigger alerts to all recently active users
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                cursor.execute('''
-                    SELECT u.id, u.phone FROM Users u
-                    JOIN (SELECT user_id, MAX(timestamp) as last_seen FROM Locations GROUP BY user_id) l
-                    ON u.id = l.user_id
-                    WHERE l.last_seen >= datetime('now', '-2 minute')
-                ''')
-                all_active = cursor.fetchall()
-                
-                for user in all_active:
-                    user_id = user['id']
-                    phone = user['phone']
-                    zone_id = "CCTV_REGION_01"
-                    
-                    # Cooldown check
-                    cursor.execute('SELECT timestamp FROM Alerts WHERE zone_id = ? AND user_id = ? ORDER BY timestamp DESC LIMIT 1', (zone_id, user_id))
-                    last_alert = cursor.fetchone()
-                    
-                    should_alert = True
-                    if last_alert:
-                        last_time = datetime.strptime(last_alert['timestamp'], '%Y-%m-%d %H:%M:%S')
-                        if (datetime.now() - last_time).total_seconds() < ALERT_COOLDOWN_SECONDS:
-                            should_alert = False
-                    
-                    if should_alert:
-                        sms_num = phone if phone.startswith('+') else f"+91{phone}"
-                        # Logging exactly who gets the message
-                        print(f"CCTV ALERT: Sending message to {sms_num}")
-                        alert_system.send_alert(sms_num, ALERT_MESSAGE)
-                        cursor.execute('INSERT INTO Alerts (zone_id, user_id) VALUES (?, ?)', (zone_id, user_id))
-                
-                conn.commit()
-                conn.close()
-
-        # Add Overlay
-        status = "NORMAL"
-        color = (0, 255, 0)
-        # Using CROWD_THRESHOLD_CAM (3) for CCTV alert logic as requested
-        if CAMERA_PERSON_COUNT >= CROWD_THRESHOLD_CAM:
-            status = "CROWD DETECTED!"
-            color = (0, 0, 255)
-
-            
-        cv2.putText(frame, f"LIVE CCTV - Count: {CAMERA_PERSON_COUNT} Status: {status}", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-
-        # Encode frame
+        # Add visual count to frame
+        cv2.putText(frame, f"CCTV COUNT: {count}", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        
         ret, buffer = cv2.imencode('.jpg', frame)
-        frame = buffer.tobytes()
+        frame_bytes = buffer.tobytes()
         yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+    if cap is not None:
+        cap.release()
 
 @app.route('/video_feed')
 def video_feed():
     return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-
-
 
 def get_db_connection():
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
     return conn
 
-def init_db():
-    if not os.path.exists(DB_NAME):
-        conn = get_db_connection()
-        with conn:
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS Users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL,
-                    phone TEXT NOT NULL,
-                    registration_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            ''')
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS Locations (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    latitude REAL NOT NULL,
-                    longitude REAL NOT NULL,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES Users (id)
-                );
-            ''')
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS Alerts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    zone_id TEXT NOT NULL,
-                    user_id INTEGER,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            ''')
-
-        conn.close()
-
-init_db()
-
 def haversine(lat1, lon1, lat2, lon2):
-    R = 6371  # Earth radius in km
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
-    c = 2 * math.asin(math.sqrt(a))
-    return R * c
+    R = 6371 # Earth radius in km
+    dLat = math.radians(lat2 - lat1)
+    dLon = math.radians(lon2 - lon1)
+    a = math.sin(dLat/2) * math.sin(dLat/2) + \
+        math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * \
+        math.sin(dLon/2) * math.sin(dLon/2)
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    return R * c * 1000 # returns meters
 
-def send_sms_alert(message):
-    print(f"Attempting to send SMS to {ADMIN_PHONE_NUMBER}...")
-    alert_system.send_alert(ADMIN_PHONE_NUMBER, message)
+# Initialize YOLO
+try:
+    from ultralytics import YOLO
+    if os.path.exists("yolov8n.pt"):
+        yolo_model = YOLO("yolov8n.pt")
+    else:
+        print("Warning: yolov8n.pt not found. CCTV detection disabled.")
+except ImportError:
+    print("Warning: ultralytics not installed. CCTV detection disabled.")
 
-
-def cluster_users(users, radius_km):
-    """
-    Groups users into clusters based on distance.
-    Returns a list of clusters, where each cluster is a list of user dicts.
-    """
-    clusters = []
-    visited = set()
+def send_bulk_alert(event_id, message, alert_type):
+    conn = get_db_connection()
+    cursor = conn.cursor()
     
-    for i in range(len(users)):
-        if i in visited:
-            continue
-            
-        cluster = [users[i]]
-        visited.add(i)
+    # Check if we already sent an alert for this event in the last 5 minutes
+    cursor.execute('''
+        SELECT timestamp FROM Alerts 
+        WHERE event_id = ? AND alert_type = ? 
+        ORDER BY timestamp DESC LIMIT 1
+    ''', (event_id, alert_type))
+    last_alert = cursor.fetchone()
+    
+    if last_alert:
+        last_time = datetime.strptime(last_alert['timestamp'], '%Y-%m-%d %H:%M:%S')
+        if (datetime.now() - last_time).total_seconds() < 300: # 5 minute cooldown
+            conn.close()
+            return
+    
+    # Send INDIVIDUALLY to all registered users of this event
+    cursor.execute('SELECT phone, telegram_chat_id FROM Users WHERE event_id = ?', (event_id,))
+    users = cursor.fetchall()
+    
+    for user in users:
+        phone = user['phone']
+        t_chat_id = user['telegram_chat_id']
+        sms_num = phone if phone.startswith('+') else f"+91{phone}"
+        print(f"Sending {alert_type} alert to {sms_num}")
         
-        # Simple BFS/DFS for connected components
-        stack = [i]
-        while stack:
-            current_idx = stack.pop()
-            current_user = users[current_idx]
+        # Send individual Telegram if user has linked their account
+        if t_chat_id:
+            try:
+                tg_url = f"https://api.telegram.org/bot{alert_system.telegram_bot_token}/sendMessage"
+                http_requests.post(tg_url, json={
+                    "chat_id": t_chat_id,
+                    "text": f"🚨 *CROWD ALERT*\n\n{message}",
+                    "parse_mode": "Markdown"
+                }, timeout=5)
+                print(f"  ✅ Telegram sent to user chat {t_chat_id}")
+            except Exception as te:
+                print(f"  Telegram send error: {te}")
+        else:
+            # Fallback: use main alert_system (sends to admin + webhook)
+            alert_system.send_alert(sms_num, message)
+    
+    # Log alert
+    cursor.execute('INSERT INTO Alerts (event_id, alert_sent, alert_type) VALUES (?, 1, ?)', (event_id, alert_type))
+    conn.commit()
+    conn.close()
+
+def monitor_crowd():
+    while True:
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
             
-            for j in range(len(users)):
-                if j not in visited:
-                    dist = haversine(
-                        current_user['latitude'], current_user['longitude'],
-                        users[j]['latitude'], users[j]['longitude']
+            # 1. Check GPS Thresholds
+            # Get latest location for all active users
+            cursor.execute('''
+                SELECT u.event_id, l.user_id, l.latitude, l.longitude 
+                FROM Locations l
+                JOIN Users u ON l.user_id = u.id
+                WHERE l.timestamp >= datetime('now', '-1 minute')
+                GROUP BY l.user_id
+            ''')
+            active_users = cursor.fetchall()
+            
+            # Group by event
+            events = {}
+            for u in active_users:
+                ev = u['event_id']
+                if ev not in events: events[ev] = []
+                events[ev].append(u)
+            
+            # Update globals for dashboard
+            all_crowded = set()
+            all_red_zones = []
+            for event_id, users in events.items():
+                crowded_users_in_event = set()
+                red_zones_in_event = []
+                
+                for u1 in users:
+                    cluster = []
+                    for u2 in users:
+                        dist = haversine(u1['latitude'], u1['longitude'], u2['latitude'], u2['longitude'])
+                        if dist <= RADIUS_METERS:
+                            cluster.append(u2['user_id'])
+                    
+                    count = len(cluster)
+                    if count >= GPS_THRESHOLD:
+                        for uid in cluster:
+                            crowded_users_in_event.add(uid)
+                        red_zones_in_event.append({"lat": u1['latitude'], "lon": u1['longitude'], "count": count})
+                
+                all_crowded.update(crowded_users_in_event)
+                all_red_zones.extend(red_zones_in_event)
+
+                max_cluster = 0
+                if red_zones_in_event:
+                    max_cluster = max(z['count'] for z in red_zones_in_event)
+                
+                # Critical Alert (Threshold + 3 = 8)
+                if max_cluster >= (GPS_THRESHOLD + 3):
+                    msg = "CRITICAL ALERT 🚨\nCrowd is heavily overcrowded. Immediate action required."
+                    send_bulk_alert(event_id, msg, "CRITICAL_GPS")
+                # Normal Alert (Threshold = 5)
+                elif max_cluster >= GPS_THRESHOLD:
+                    msg = "BE SAFE: You are in a heavy crowd. Please move somewhere safe. [Your life is important to us]"
+                    send_bulk_alert(event_id, msg, "NORMAL_GPS")
+
+            global GLOBAL_CROWDED_USERS, GLOBAL_RED_ZONES
+            GLOBAL_CROWDED_USERS = all_crowded
+            GLOBAL_RED_ZONES = all_red_zones
+
+            # 2. Check CCTV Global Threshold (Applied to all active events)
+            if CAMERA_PERSON_COUNT >= (CCTV_THRESHOLD + 3):
+                msg = "CRITICAL ALERT 🚨 (CCTV)\nCrowd is heavily overcrowded. Immediate action required."
+                for ev in events.keys():
+                    send_bulk_alert(ev, msg, "CRITICAL_CCTV")
+            elif CAMERA_PERSON_COUNT >= CCTV_THRESHOLD:
+                msg = "ALERT ⚠️ (CCTV)\nCrowd limit exceeded. Please take necessary action."
+                for ev in events.keys():
+                    send_bulk_alert(ev, msg, "NORMAL_CCTV")
+
+            conn.close()
+        except Exception as e:
+            print(f"Monitor error: {e}")
+        
+        time.sleep(CHECK_INTERVAL)
+
+# --- Telegram Bot Auto-Linker ---
+# Listens for incoming messages, if user sends their registered phone number
+# the bot links their Telegram chat to their account in the database.
+TELEGRAM_BOT_TOKEN = "8542498176:AAGk5Z-_5GYIn6RGkCP73aZ8K3gywYn0vaQ"
+TELEGRAM_POLL_OFFSET = 0
+
+def telegram_bot_listener():
+    global TELEGRAM_POLL_OFFSET
+    print("✅ Telegram bot listener started. Waiting for users to link their phones...")
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+            params = {"offset": TELEGRAM_POLL_OFFSET, "timeout": 10}
+            resp = http_requests.get(url, params=params, timeout=15)
+            if resp.status_code != 200:
+                time.sleep(5)
+                continue
+
+            data = resp.json()
+            for update in data.get("result", []):
+                TELEGRAM_POLL_OFFSET = update["update_id"] + 1
+                msg = update.get("message", {})
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+                text = msg.get("text", "").strip()
+                
+                if not chat_id or not text:
+                    continue
+                
+                # Clean phone from user input
+                phone_input = text.replace("+91", "").replace("+", "").replace(" ", "").strip()
+                
+                # Check if it's a /start command
+                if text == "/start":
+                    reply = (
+                        "👋 *Welcome to Crowd Alert Bot!*\n\n"
+                        "To receive personal crowd alerts, send me your *registered phone number*.\n"
+                        "Example: `9025267350`\n\n"
+                        "Once linked, you'll get alerts directly here when crowds are detected at your event! 🚨"
                     )
-                    if dist <= radius_km:
-                        visited.add(j)
-                        cluster.append(users[j])
-                        stack.append(j)
-        
-        if len(cluster) > 0:
-            clusters.append(cluster)
-            
-    return clusters
+                    http_requests.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                        json={"chat_id": chat_id, "text": reply, "parse_mode": "Markdown"}
+                    )
+                    continue
 
+                # Try to match phone number in DB
+                if phone_input.isdigit() and len(phone_input) >= 10:
+                    conn = get_db_connection()
+                    cursor = conn.cursor()
+                    # Look for last 10 digits match
+                    cursor.execute("SELECT id, name FROM Users WHERE phone LIKE ?", (f"%{phone_input[-10:]}",))
+                    user = cursor.fetchone()
+                    
+                    if user:
+                        cursor.execute("UPDATE Users SET telegram_chat_id = ? WHERE id = ?", (chat_id, user["id"]))
+                        conn.commit()
+                        conn.close()
+                        name = user["name"]
+                        print(f"✅ Telegram linked: {name} ({phone_input}) → chat {chat_id}")
+                        http_requests.post(
+                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                            json={
+                                "chat_id": chat_id,
+                                "text": (
+                                    f"✅ *Linked Successfully, {name}!*\n\n"
+                                    f"Phone: `{phone_input}`\n"
+                                    "You will now receive *individual crowd alerts* directly here whenever crowd density exceeds the threshold at your event.\n\n"
+                                    "Stay safe! 🙏"
+                                ),
+                                "parse_mode": "Markdown"
+                            }
+                        )
+                    else:
+                        conn.close()
+                        http_requests.post(
+                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                            json={
+                                "chat_id": chat_id,
+                                "text": (
+                                    f"❌ Phone number `{phone_input}` not found.\n\n"
+                                    "Please register first at the event registration page, then send your phone number here."
+                                ),
+                                "parse_mode": "Markdown"
+                            }
+                        )
+        except Exception as e:
+            print(f"Telegram listener error: {e}")
+            time.sleep(5)
 
+# Start background threads
+threading.Thread(target=monitor_crowd, daemon=True).start()
+threading.Thread(target=telegram_bot_listener, daemon=True).start()
+
+# --- Routes ---
 @app.route('/')
-def index():
-    return render_template('register.html')
-
-@app.route('/dashboard')
 def dashboard():
     return render_template('dashboard.html')
+
+@app.route('/register_page')
+def register_page():
+    return render_template('register.html')
 
 @app.route('/register', methods=['POST'])
 def register():
     data = request.json
     name = data.get('name')
     phone = data.get('phone')
+    event_id = data.get('event_id', 'E01')
+    telegram_chat_id = data.get('telegram_chat_id', None)
     
-    if not name or not phone:
-        return jsonify({"error": "Name and phone are required"}), 400
-
     conn = get_db_connection()
     cursor = conn.cursor()
-    
-    # Check if phone already registered (simple check)
-    cursor.execute('SELECT id FROM Users WHERE phone = ?', (phone,))
-    existing_user = cursor.fetchone()
-    
-    if existing_user:
-        user_id = existing_user['id']
-    else:
-        cursor.execute('INSERT INTO Users (name, phone) VALUES (?, ?)', (name, phone))
-        user_id = cursor.lastrowid
-        conn.commit()
-    
+    # Add telegram_chat_id column if not exists
+    cursor.execute("PRAGMA table_info(Users)")
+    cols = [c['name'] for c in cursor.fetchall()]
+    if 'telegram_chat_id' not in cols:
+        cursor.execute('ALTER TABLE Users ADD COLUMN telegram_chat_id TEXT')
+    cursor.execute('INSERT INTO Users (name, phone, event_id, telegram_chat_id) VALUES (?, ?, ?, ?)', (name, phone, event_id, telegram_chat_id))
+    user_id = cursor.lastrowid
+    conn.commit()
     conn.close()
-    return jsonify({"user_id": user_id, "message": "Registered successfully"})
-
-@app.route('/camera-update', methods=['POST'])
-def update_camera_data():
-    global CAMERA_PERSON_COUNT, LAST_CAMERA_UPDATE
-    data = request.json
-    CAMERA_PERSON_COUNT = data.get('person_count', 0)
-    LAST_CAMERA_UPDATE = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    
-    # If camera count is high, we could trigger a general alert as well
-    if CAMERA_PERSON_COUNT >= CROWD_THRESHOLD_CAM:
-
-        msg = f"⚠ CAMERA ALERT: High crowd density detected via optical sensor. Count: {CAMERA_PERSON_COUNT} people."
-        # send_sms_alert(msg) # Optional: Trigger SMS on camera count too
-        
-    return jsonify({"status": "success", "count": CAMERA_PERSON_COUNT})
-
+    return jsonify({"user_id": user_id, "status": "success"})
 
 @app.route('/location', methods=['POST'])
-def update_location():
+def log_location():
     data = request.json
     user_id = data.get('user_id')
     lat = data.get('latitude')
     lon = data.get('longitude')
-
+    
     if not user_id or lat is None or lon is None:
-        return jsonify({"error": "Invalid data"}), 400
-
+        return jsonify({"error": "Missing data"}), 400
+        
     conn = get_db_connection()
     cursor = conn.cursor()
-
-    # Log location
     cursor.execute('INSERT INTO Locations (user_id, latitude, longitude) VALUES (?, ?, ?)', (user_id, lat, lon))
     conn.commit()
-
-    # Get active users (last 1 minute for simplicity) to calculate crowd
-    # We only care about the MOST RECENT location of each active user
-    cursor.execute('''
-        SELECT user_id, latitude, longitude, MAX(timestamp) as last_seen
-        FROM Locations
-        GROUP BY user_id
-        HAVING last_seen >= datetime('now', '-1 minute')
-    ''')
-    active_users = cursor.fetchall()
-    
-    nearby_count = 0
-    # Include the current user in the count? "Count how many users are within 100 meters" usually means including self or excluding? 
-    # Usually "crowd" implies number of people in an area. So including self makes sense if the threshold is for total people.
-    # But usually creating a crowd requires > 1 person. Let's include self.
-    
-    for user in active_users:
-        # Calculate distance
-        dist = haversine(lat, lon, user['latitude'], user['longitude'])
-        if dist <= CROWD_RADIUS_KM:
-            nearby_count += 1
-            
-    is_crowded = nearby_count >= CROWD_THRESHOLD_LOC
-
-    
-    response = {
-        "status": "success",
-        "crowd_alert": is_crowded
-    }
-    
-    if is_crowded:
-        # Generate exit link (placeholder logic or a fixed point if not specified how to calculate exit)
-        # Requirement: "Generate Google Maps exit link: ... destination=EVENT_EXIT_LAT,EVENT_EXIT_LON"
-        # I'll use a placeholder exit location since none was provided
-        # Let's assume exit is at 0,0 or ask user to configure. 
-        # Actually the prompt says: "EVENT_EXIT_LAT,EVENT_EXIT_LON". I will define a constant for now.
-        EXIT_LAT = 12.9716 # Example: Bangalore
-        EXIT_LON = 77.5946 
-        # But wait, the user's location is dynamic. The exit should be relative or fixed? Usually fixed for an event.
-        response["message"] = "⚠ HEAVY CROWD DETECTED. Please move to a safer area."
-        response["exit_link"] = f"https://www.google.com/maps/dir/?api=1&destination={EXIT_LAT},{EXIT_LON}"
-
     conn.close()
-    return jsonify(response)
+    
+    is_crowded = user_id in GLOBAL_CROWDED_USERS
+    return jsonify({
+        "status": "logged",
+        "is_crowded": is_crowded,
+        "crowd_alert": is_crowded
+    })
 
-@app.route('/current-locations', methods=['GET'])
+@app.route('/upload-frame', methods=['POST'])
+def upload_frame():
+    global CAMERA_PERSON_COUNT, LAST_CAMERA_UPDATE
+    import base64
+    import numpy as np
+    try:
+        data = request.json
+        image_data = data.get('image')
+        header, encoded = image_data.split(",", 1)
+        decoded = base64.b64decode(encoded)
+        nparr = np.frombuffer(decoded, np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        count = 0
+        if yolo_model:
+            results = yolo_model(frame, conf=0.4, verbose=False)
+            for r in results:
+                if hasattr(r, 'boxes') and r.boxes is not None:
+                    for box in r.boxes:
+                        cls = int(box.cls[0])
+                        if yolo_model.names[cls] == "person":
+                            count = count + 1
+            CAMERA_PERSON_COUNT = count
+            LAST_CAMERA_UPDATE = datetime.now().strftime('%H:%M:%S')
+        return jsonify({"count": count})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/current-locations')
 def get_current_locations():
     conn = get_db_connection()
     cursor = conn.cursor()
-
-    # Get latest location for all active users (last 2 minutes)
     cursor.execute('''
         SELECT u.id, u.name, u.phone, l.latitude, l.longitude, MAX(l.timestamp) as last_seen
         FROM Locations l
         JOIN Users u ON l.user_id = u.id
+        WHERE l.timestamp >= datetime('now', '-2 minute')
         GROUP BY l.user_id
-        HAVING last_seen >= datetime('now', '-2 minute')
     ''')
-
     active_users = cursor.fetchall()
-
-    # Clustering Logic
-    clusters = cluster_users(active_users, CROWD_RADIUS_KM)
-    red_zones = []
-    crowded_users_ids = set()
-
-    for cluster in clusters:
-        if len(cluster) >= CROWD_THRESHOLD_LOC:
-            # Red Zone detected
-            avg_lat = sum(u['latitude'] for u in cluster) / len(cluster)
-            avg_lon = sum(u['longitude'] for u in cluster) / len(cluster)
-            zone_id = f"{avg_lat:.4f}_{avg_lon:.4f}"
-            
-            red_zones.append({
-                "lat": avg_lat, "lon": avg_lon,
-                "count": len(cluster), "radius": CROWD_RADIUS_KM * 1000
-            })
-            
-            for user in cluster:
-                # Trigger individual SMS to each user in the crowd
-                user_id = user['id']
-                phone = user['phone'] # Need to ensure phone is in the select
-                
-                # Check cooldown per user/zone
-                cursor.execute('''
-                    SELECT timestamp FROM Alerts 
-                    WHERE zone_id = ? AND user_id = ?
-                    ORDER BY timestamp DESC LIMIT 1
-                ''', (zone_id, user_id))
-                last_alert = cursor.fetchone()
-                
-                should_alert = True
-                if last_alert:
-                    last_time = datetime.strptime(last_alert['timestamp'], '%Y-%m-%d %H:%M:%S')
-                    if (datetime.now() - last_time).total_seconds() < ALERT_COOLDOWN_SECONDS:
-                        should_alert = False
-                
-                if should_alert:
-                    print(f"Sending heavy crowd alert to {phone}")
-                    # Ensure Indian number format if not already (adding +91 if 10 digits)
-                    sms_num = phone if phone.startswith('+') else f"+91{phone}"
-                    alert_system.send_alert(sms_num, ALERT_MESSAGE)
-                    
-                    cursor.execute('INSERT INTO Alerts (zone_id, user_id) VALUES (?, ?)', (zone_id, user_id))
-                    conn.commit()
-
+    
     users_data = []
     for u in active_users:
-        is_crowded = u['id'] in crowded_users_ids
         users_data.append({
-            "id": u['id'], "name": u['name'],
+            "id": u['id'], "name": u['name'], "phone": u['phone'],
             "latitude": u['latitude'], "longitude": u['longitude'],
-            "is_crowded": is_crowded
+            "is_crowded": u['id'] in GLOBAL_CROWDED_USERS
         })
-
     
+    cursor.execute('SELECT * FROM Alerts ORDER BY timestamp DESC LIMIT 5')
+    recent_alerts = [dict(row) for row in cursor.fetchall()]
+
     conn.close()
     return jsonify({
         "users": users_data,
-        "total_active": len(active_users),
-        "crowd_zones": len(red_zones),
-        "red_zones": red_zones,
+        "total_active": len(users_data),
         "camera_count": CAMERA_PERSON_COUNT,
-        "last_camera_sync": LAST_CAMERA_UPDATE
+        "recent_alerts": recent_alerts,
+        "red_zones": GLOBAL_RED_ZONES
     })
 
-
 if __name__ == '__main__':
-    # Use the port assigned by Render, or default to 5000
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 5001))
     app.run(debug=False, host='0.0.0.0', port=port)

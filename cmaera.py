@@ -4,7 +4,7 @@ import requests
 
 model = YOLO("yolov8n.pt")
 
-cap = cv2.VideoCapture(https://10.141.231.107:8080/)
+cap = cv2.VideoCapture("https://10.141.231.107:8080/")
 
 if not cap.isOpened():
     print("Camera not working")

@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Event Registration - Crowd Monitor</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', sans-serif;
+            background: #f4f4f9;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+
+        .container {
+            background: white;
+            padding: 2rem;
+            border-radius: 10px;
+            width: 100%;
+            max-width: 400px;
+            text-align: center;
+        }
+
+        input {
+            width: 100%;
+            padding: 10px;
+            margin: 10px 0;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+        }
+
+        button {
+            width: 100%;
+            padding: 10px;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container" id="reg-form">
+        <h1>Register for Event</h1>
+        <input type="text" id="name" placeholder="Full Name" maxlength="20">
+        <input type="tel" id="phone" placeholder="Phone Number (10 digits)" pattern="[6-9]{1}[0-9]{9}">
+        <button onclick="register()">Register & Start Tracking</button>
+    </div>
+    <div id="status" style="display:none; text-align:center;">
+        <h2>Tracking Active</h2>
+        <p>Keep this page open.</p>
+    </div>
+    <script>
+        const BACKEND_URL = localStorage.getItem('backend_url') || "";
+        if (!BACKEND_URL) {
+            const url = prompt("Enter your Render Backend URL:");
+            if (url) localStorage.setItem('backend_url', url);
+        }
+
+        async function register() {
+            const name = document.getElementById('name').value;
+            const phone = document.getElementById('phone').value;
+            const res = await fetch(BACKEND_URL + '/register', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name, phone })
+            });
+            const data = await res.json();
+            if (data.user_id) {
+                localStorage.setItem('crowd_user_id', data.user_id);
+                document.getElementById('reg-form').style.display = 'none';
+                document.getElementById('status').style.display = 'block';
+                startTracking(data.user_id);
+            }
+        }
+
+        function startTracking(uid) {
+            navigator.geolocation.watchPosition(async (pos) => {
+                await fetch(BACKEND_URL + '/location', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        user_id: uid,
+                        latitude: pos.coords.latitude,
+                        longitude: pos.coords.longitude
+                    })
+                });
+            });
+        }
+    </script>
+</body>
+
+</html>

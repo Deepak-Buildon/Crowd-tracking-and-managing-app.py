@@ -1,40 +1,87 @@
-from twilio.rest import Client
-from twilio.base.exceptions import TwilioRestException
+import requests
+import json
+from datetime import datetime
+from urllib.parse import quote
 
 class Alertmsg:
     def __init__(self):
-        self.account_sid = "ACb34032adfa3fba953d8e5cd926cfa986"
-        self.auth_token = "62fb90d39fd1ecc22a627790f5367c56"
-        self.from_number = '+17752528920'
+        # --- Telegram ---
+        self.use_telegram = False
+        self.telegram_bot_token = ""
+        self.telegram_chat_id = ""
+
+        # --- n8n / Generic Webhook ---
+        self.use_webhook = False
+        self.webhook_url = ""
+
+        # --- WhatsApp (CallMeBot) ---
+        self.use_whatsapp = False
+        self.whatsapp_apikey = ""
+
+        # --- Twilio SMS (disabled) ---
+        self.use_twilio = False
 
     def send_alert(self, number, message):
         """
-        Sends an SMS alert using Twilio.
+        Sends alerts through all configured channels.
         """
-        try:
-            client = Client(self.account_sid, self.auth_token)
+        print(f"--- Triggering Alert for {number} ---")
+        success = False
 
-            sent_message = client.messages.create(
-                from_=self.from_number,
-                body=message,
-                to=number
-            )
+        # 1. Telegram Alert (Free & Reliable)
+        if self.use_telegram and self.telegram_bot_token and self.telegram_chat_id:
+            try:
+                url = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
+                payload = {
+                    "chat_id": self.telegram_chat_id,
+                    "text": f"🚨 *CROWD ALERT*\n\nPhone: `{number}`\n\n{message}",
+                    "parse_mode": "Markdown"
+                }
+                resp = requests.post(url, json=payload, timeout=10)
+                if resp.status_code == 200:
+                    print(f"✅ Telegram alert sent to chat {self.telegram_chat_id}")
+                    success = True
+                else:
+                    print(f"Telegram Error: {resp.text}")
+            except Exception as e:
+                print(f"Telegram Error: {e}")
 
-            print(f"Alert sent successfully to {number}! SID: {sent_message.sid}")
-            return sent_message.sid
+        # 2. WhatsApp Alert (via CallMeBot - Free)
+        if self.use_whatsapp and self.whatsapp_apikey:
+            try:
+                clean_num = number.replace("+", "").replace(" ", "")
+                encoded_msg = quote(message)
+                url = f"https://api.callmebot.com/whatsapp.php?phone={clean_num}&text={encoded_msg}&apikey={self.whatsapp_apikey}"
+                requests.get(url, timeout=10)
+                print(f"✅ WhatsApp alert sent to {number}")
+                success = True
+            except Exception as e:
+                print(f"WhatsApp Error: {e}")
 
-        except TwilioRestException as e:
-            print(f"Twilio Error: {e}")
-            return None
+        # 3. Webhook Alert (for n8n, Zapier, etc)
+        if self.use_webhook and self.webhook_url:
+            try:
+                payload = {
+                    "phone": number,
+                    "message": message,
+                    "channel": "whatsapp" if self.use_whatsapp else "generic",
+                    "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
+                resp = requests.post(self.webhook_url, json=payload, timeout=10)
+                print(f"✅ Webhook (n8n) alert sent. Status: {resp.status_code}")
+                success = True
+            except Exception as e:
+                print(f"Webhook Error: {e}")
 
-        except Exception as e:
-            print(f"Unexpected Error: {e}")
-            return None
+        # 4. Local Console Alert (always active)
+        print(f"📋 LOCAL LOG: [{number}] -> {message}")
+        return success
+
 
 if __name__ == "__main__":
-    print("--- Twilio Alert System Test ---")
+    print("--- Multi-Channel Alert System Test ---")
     alert_system = Alertmsg()
-    recipient_number = input("Enter recipient number (+1234567890): ").strip()
+    recipient_number = input("Enter recipient number: ").strip()
     alert_message = input("Enter message: ").strip()
 
     if recipient_number and alert_message:
